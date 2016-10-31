@@ -3,40 +3,42 @@ package libnetwork
 import (
 	"testing"
 
+	"github.com/docker/libnetwork/config"
 	"github.com/docker/libnetwork/netlabel"
 	"github.com/docker/libnetwork/options"
 	"github.com/docker/libnetwork/osl"
 	"github.com/docker/libnetwork/testutils"
 )
 
-func createEmptyCtrlr() *controller {
-	return &controller{sandboxes: sandboxTable{}}
-}
-
-func getTestEnv(t *testing.T) (NetworkController, Network, Network) {
-	c, err := New()
-	if err != nil {
-		t.Fatal(err)
-	}
+func getTestEnv(t *testing.T, empty bool) (NetworkController, Network, Network) {
+	netType := "bridge"
 
 	option := options.Generic{
 		"EnableIPForwarding": true,
 	}
 	genericOption := make(map[string]interface{})
 	genericOption[netlabel.GenericData] = option
-	if err := c.ConfigureNetworkDriver("bridge", genericOption); err != nil {
+
+	cfgOptions, err := OptionBoltdbWithRandomDBFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(append(cfgOptions, config.OptionDriverConfig(netType, genericOption))...)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	netType := "bridge"
+	if empty {
+		return c, nil, nil
+	}
+
 	name1 := "test_nw_1"
 	netOption1 := options.Generic{
 		netlabel.GenericData: options.Generic{
-			"BridgeName":            name1,
-			"AllowNonDefaultBridge": true,
+			"BridgeName": name1,
 		},
 	}
-	n1, err := c.NewNetwork(netType, name1, NetworkOptionGeneric(netOption1))
+	n1, err := c.NewNetwork(netType, name1, "", NetworkOptionGeneric(netOption1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,11 +46,10 @@ func getTestEnv(t *testing.T) (NetworkController, Network, Network) {
 	name2 := "test_nw_2"
 	netOption2 := options.Generic{
 		netlabel.GenericData: options.Generic{
-			"BridgeName":            name2,
-			"AllowNonDefaultBridge": true,
+			"BridgeName": name2,
 		},
 	}
-	n2, err := c.NewNetwork(netType, name2, NetworkOptionGeneric(netOption2))
+	n2, err := c.NewNetwork(netType, name2, "", NetworkOptionGeneric(netOption2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +58,8 @@ func getTestEnv(t *testing.T) (NetworkController, Network, Network) {
 }
 
 func TestSandboxAddEmpty(t *testing.T) {
-	ctrlr := createEmptyCtrlr()
+	c, _, _ := getTestEnv(t, true)
+	ctrlr := c.(*controller)
 
 	sbx, err := ctrlr.NewSandbox("sandbox0")
 	if err != nil {
@@ -80,7 +82,7 @@ func TestSandboxAddMultiPrio(t *testing.T) {
 		defer testutils.SetupTestOSContext(t)()
 	}
 
-	c, nw, _ := getTestEnv(t)
+	c, nw, _ := getTestEnv(t, false)
 	ctrlr := c.(*controller)
 
 	sbx, err := ctrlr.NewSandbox("sandbox1")
@@ -114,21 +116,25 @@ func TestSandboxAddMultiPrio(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ctrlr.sandboxes[sid].endpoints[0] != ep3 {
+	if ctrlr.sandboxes[sid].endpoints[0].ID() != ep3.ID() {
 		t.Fatal("Expected ep3 to be at the top of the heap. But did not find ep3 at the top of the heap")
+	}
+
+	if len(sbx.Endpoints()) != 3 {
+		t.Fatal("Expected 3 endpoints to be connected to the sandbox.")
 	}
 
 	if err := ep3.Leave(sbx); err != nil {
 		t.Fatal(err)
 	}
-	if ctrlr.sandboxes[sid].endpoints[0] != ep2 {
+	if ctrlr.sandboxes[sid].endpoints[0].ID() != ep2.ID() {
 		t.Fatal("Expected ep2 to be at the top of the heap after removing ep3. But did not find ep2 at the top of the heap")
 	}
 
 	if err := ep2.Leave(sbx); err != nil {
 		t.Fatal(err)
 	}
-	if ctrlr.sandboxes[sid].endpoints[0] != ep1 {
+	if ctrlr.sandboxes[sid].endpoints[0].ID() != ep1.ID() {
 		t.Fatal("Expected ep1 to be at the top of the heap after removing ep2. But did not find ep1 at the top of the heap")
 	}
 
@@ -137,7 +143,7 @@ func TestSandboxAddMultiPrio(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ctrlr.sandboxes[sid].endpoints[0] != ep3 {
+	if ctrlr.sandboxes[sid].endpoints[0].ID() != ep3.ID() {
 		t.Fatal("Expected ep3 to be at the top of the heap after adding ep3 back. But did not find ep3 at the top of the heap")
 	}
 
@@ -157,7 +163,7 @@ func TestSandboxAddSamePrio(t *testing.T) {
 		defer testutils.SetupTestOSContext(t)()
 	}
 
-	c, nw1, nw2 := getTestEnv(t)
+	c, nw1, nw2 := getTestEnv(t, false)
 
 	ctrlr := c.(*controller)
 
@@ -184,7 +190,7 @@ func TestSandboxAddSamePrio(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ctrlr.sandboxes[sid].endpoints[0] != ep1 {
+	if ctrlr.sandboxes[sid].endpoints[0].ID() != ep1.ID() {
 		t.Fatal("Expected ep1 to be at the top of the heap. But did not find ep1 at the top of the heap")
 	}
 
@@ -192,7 +198,7 @@ func TestSandboxAddSamePrio(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ctrlr.sandboxes[sid].endpoints[0] != ep2 {
+	if ctrlr.sandboxes[sid].endpoints[0].ID() != ep2.ID() {
 		t.Fatal("Expected ep2 to be at the top of the heap after removing ep3. But did not find ep2 at the top of the heap")
 	}
 

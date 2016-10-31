@@ -1,15 +1,20 @@
 package osl
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/docker/libnetwork/netutils"
+	"github.com/docker/libnetwork/testutils"
+	"github.com/docker/libnetwork/types"
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
 )
 
@@ -21,8 +26,16 @@ const (
 	sboxIfaceName = "containername"
 )
 
+func generateRandomName(prefix string, size int) (string, error) {
+	id := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, id); err != nil {
+		return "", err
+	}
+	return prefix + hex.EncodeToString(id)[:size], nil
+}
+
 func newKey(t *testing.T) (string, error) {
-	name, err := netutils.GenerateRandomName("netns", 12)
+	name, err := generateRandomName("netns", 12)
 	if err != nil {
 		return "", err
 	}
@@ -40,11 +53,11 @@ func newKey(t *testing.T) (string, error) {
 	return name, nil
 }
 
-func newInfo(t *testing.T) (Sandbox, error) {
+func newInfo(hnd *netlink.Handle, t *testing.T) (Sandbox, error) {
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: vethName1, TxQLen: 0},
 		PeerName:  vethName2}
-	if err := netlink.LinkAdd(veth); err != nil {
+	if err := hnd.LinkAdd(veth); err != nil {
 		return nil, err
 	}
 
@@ -85,7 +98,7 @@ func newInfo(t *testing.T) (Sandbox, error) {
 		LinkAttrs: netlink.LinkAttrs{Name: vethName3, TxQLen: 0},
 		PeerName:  vethName4}
 
-	if err := netlink.LinkAdd(veth); err != nil {
+	if err := hnd.LinkAdd(veth); err != nil {
 		return nil, err
 	}
 
@@ -109,29 +122,20 @@ func verifySandbox(t *testing.T, s Sandbox, ifaceSuffixes []string) {
 		t.Fatalf("The sandox interface returned is not of type networkNamespace")
 	}
 
-	origns, err := netns.Get()
-	if err != nil {
-		t.Fatalf("Could not get the current netns: %v", err)
-	}
-	defer origns.Close()
-
-	f, err := os.OpenFile(s.Key(), os.O_RDONLY, 0)
+	sbNs, err := netns.GetFromPath(s.Key())
 	if err != nil {
 		t.Fatalf("Failed top open network namespace path %q: %v", s.Key(), err)
 	}
-	defer f.Close()
+	defer sbNs.Close()
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	nsFD := f.Fd()
-	if err = netns.Set(netns.NsHandle(nsFD)); err != nil {
-		t.Fatalf("Setting to the namespace pointed to by the sandbox %s failed: %v", s.Key(), err)
+	nh, err := netlink.NewHandleAt(sbNs)
+	if err != nil {
+		t.Fatal(err)
 	}
-	defer netns.Set(origns)
+	defer nh.Delete()
 
 	for _, suffix := range ifaceSuffixes {
-		_, err = netlink.LinkByName(sboxIfaceName + suffix)
+		_, err = nh.LinkByName(sboxIfaceName + suffix)
 		if err != nil {
 			t.Fatalf("Could not find the interface %s inside the sandbox: %v",
 				sboxIfaceName+suffix, err)
@@ -162,7 +166,7 @@ func TestScanStatistics(t *testing.T) {
 			"    lo:  783782    1853    0    0    0     0          0         0   783782    1853    0    0    0     0       0          0\n" +
 			"lxcbr0:       0       0    0    0    0     0          0         0     9006      61    0    0    0     0       0          0\n"
 
-	i := &InterfaceStatistics{}
+	i := &types.InterfaceStatistics{}
 
 	if err := scanInterfaceStats(data, "wlan0", i); err != nil {
 		t.Fatal(err)
@@ -176,5 +180,48 @@ func TestScanStatistics(t *testing.T) {
 	}
 	if i.TxBytes != 9006 || i.TxPackets != 61 || i.RxBytes != 0 || i.RxPackets != 0 {
 		t.Fatalf("Error scanning the statistics")
+	}
+}
+
+func TestDisableIPv6DAD(t *testing.T) {
+	if testutils.RunningOnCircleCI() {
+		t.Skipf("Skipping as not supported on CIRCLE CI kernel")
+	}
+
+	defer testutils.SetupTestOSContext(t)()
+
+	ipv6, _ := types.ParseCIDR("2001:db8::44/64")
+	iface := &nwIface{addressIPv6: ipv6}
+
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: "sideA"},
+		PeerName:  "sideB",
+	}
+	nlh, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = nlh.LinkAdd(veth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	link, err := nlh.LinkByName("sideA")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = setInterfaceIPv6(nlh, link, iface)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addrList, err := nlh.AddrList(link, nl.FAMILY_V6)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if addrList[0].Flags&syscall.IFA_F_NODAD == 0 {
+		t.Fatalf("Unexpected interface flags: 0x%x. Expected to contain 0x%x", addrList[0].Flags, syscall.IFA_F_NODAD)
 	}
 }

@@ -1,31 +1,56 @@
 package overlay
 
 import (
+	"net"
 	"testing"
 	"time"
 
+	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/docker/libkv/store/consul"
+	"github.com/docker/libnetwork/datastore"
+	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
+	"github.com/docker/libnetwork/netlabel"
 	_ "github.com/docker/libnetwork/testutils"
 )
 
+func init() {
+	consul.Register()
+}
+
 type driverTester struct {
 	t *testing.T
-	d driverapi.Driver
+	d *driver
 }
 
 const testNetworkType = "overlay"
 
 func setupDriver(t *testing.T) *driverTester {
 	dt := &driverTester{t: t}
-	if err := Init(dt); err != nil {
+	config := make(map[string]interface{})
+	config[netlabel.GlobalKVClient] = discoverapi.DatastoreConfigData{
+		Scope:    datastore.GlobalScope,
+		Provider: "consul",
+		Address:  "127.0.0.01:8500",
+	}
+
+	if err := Init(dt, config); err != nil {
 		t.Fatal(err)
 	}
 
-	opt := make(map[string]interface{})
-	if err := dt.d.Config(opt); err != nil {
+	iface, err := net.InterfaceByName("eth0")
+	if err != nil {
 		t.Fatal(err)
 	}
-
+	addrs, err := iface.Addrs()
+	if err != nil || len(addrs) == 0 {
+		t.Fatal(err)
+	}
+	data := discoverapi.NodeDiscoveryData{
+		Address: addrs[0].String(),
+		Self:    true,
+	}
+	dt.d.DiscoverNew(discoverapi.NodeDiscovery, data)
 	return dt
 }
 
@@ -41,6 +66,10 @@ func cleanupDriver(t *testing.T, dt *driverTester) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("test timed out because Fini() did not return on time")
 	}
+}
+
+func (dt *driverTester) GetPluginGetter() plugingetter.PluginGetter {
+	return nil
 }
 
 func (dt *driverTester) RegisterDriver(name string, drv driverapi.Driver,
@@ -60,27 +89,14 @@ func (dt *driverTester) RegisterDriver(name string, drv driverapi.Driver,
 }
 
 func TestOverlayInit(t *testing.T) {
-	if err := Init(&driverTester{t: t}); err != nil {
+	if err := Init(&driverTester{t: t}, nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestOverlayFiniWithoutConfig(t *testing.T) {
 	dt := &driverTester{t: t}
-	if err := Init(dt); err != nil {
-		t.Fatal(err)
-	}
-
-	cleanupDriver(t, dt)
-}
-
-func TestOverlayNilConfig(t *testing.T) {
-	dt := &driverTester{t: t}
-	if err := Init(dt); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := dt.d.Config(nil); err != nil {
+	if err := Init(dt, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -92,7 +108,7 @@ func TestOverlayConfig(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	d := dt.d.(*driver)
+	d := dt.d
 	if d.notifyCh == nil {
 		t.Fatal("Driver notify channel wasn't initialzed after Config method")
 	}
@@ -108,19 +124,9 @@ func TestOverlayConfig(t *testing.T) {
 	cleanupDriver(t, dt)
 }
 
-func TestOverlayMultipleConfig(t *testing.T) {
-	dt := setupDriver(t)
-
-	if err := dt.d.Config(nil); err == nil {
-		t.Fatal("Expected a failure, instead succeded")
-	}
-
-	cleanupDriver(t, dt)
-}
-
 func TestOverlayType(t *testing.T) {
 	dt := &driverTester{t: t}
-	if err := Init(dt); err != nil {
+	if err := Init(dt, nil); err != nil {
 		t.Fatal(err)
 	}
 

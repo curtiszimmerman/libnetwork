@@ -12,9 +12,8 @@ import (
 func TestLinkCreate(t *testing.T) {
 	defer testutils.SetupTestOSContext(t)()
 	d := newDriver()
-	dr := d.(*driver)
 
-	if err := d.Config(nil); err != nil {
+	if err := d.configure(nil); err != nil {
 		t.Fatalf("Failed to setup driver config: %v", err)
 	}
 
@@ -27,13 +26,14 @@ func TestLinkCreate(t *testing.T) {
 	genericOption := make(map[string]interface{})
 	genericOption[netlabel.GenericData] = config
 
-	err := d.CreateNetwork("dummy", genericOption)
+	ipdList := getIPv4Data(t, "")
+	err := d.CreateNetwork("dummy", genericOption, nil, ipdList, nil)
 	if err != nil {
 		t.Fatalf("Failed to create bridge: %v", err)
 	}
 
-	te := &testEndpoint{}
-	err = d.CreateEndpoint("dummy", "", te, nil)
+	te := newTestEndpoint(ipdList[0].Pool, 10)
+	err = d.CreateEndpoint("dummy", "", te.Interface(), nil)
 	if err != nil {
 		if _, ok := err.(InvalidEndpointIDError); !ok {
 			t.Fatalf("Failed with a wrong error :%s", err.Error())
@@ -43,7 +43,7 @@ func TestLinkCreate(t *testing.T) {
 	}
 
 	// Good endpoint creation
-	err = d.CreateEndpoint("dummy", "ep", te, nil)
+	err = d.CreateEndpoint("dummy", "ep", te.Interface(), nil)
 	if err != nil {
 		t.Fatalf("Failed to create a link: %s", err.Error())
 	}
@@ -64,8 +64,8 @@ func TestLinkCreate(t *testing.T) {
 	// TODO: if we could get peer name from (sboxLnk.(*netlink.Veth)).PeerName
 	// then we could check the MTU on hostLnk as well.
 
-	te1 := &testEndpoint{iface: &testInterface{}}
-	err = d.CreateEndpoint("dummy", "ep", te1, nil)
+	te1 := newTestEndpoint(ipdList[0].Pool, 11)
+	err = d.CreateEndpoint("dummy", "ep", te1.Interface(), nil)
 	if err == nil {
 		t.Fatalf("Failed to detect duplicate endpoint id on same network")
 	}
@@ -79,7 +79,7 @@ func TestLinkCreate(t *testing.T) {
 		t.Fatalf("Could not find source link %s: %v", te.iface.srcName, err)
 	}
 
-	n, ok := dr.networks["dummy"]
+	n, ok := d.networks["dummy"]
 	if !ok {
 		t.Fatalf("Cannot find network %s inside driver", "dummy")
 	}
@@ -108,7 +108,7 @@ func TestLinkCreateTwo(t *testing.T) {
 	defer testutils.SetupTestOSContext(t)()
 	d := newDriver()
 
-	if err := d.Config(nil); err != nil {
+	if err := d.configure(nil); err != nil {
 		t.Fatalf("Failed to setup driver config: %v", err)
 	}
 
@@ -118,19 +118,20 @@ func TestLinkCreateTwo(t *testing.T) {
 	genericOption := make(map[string]interface{})
 	genericOption[netlabel.GenericData] = config
 
-	err := d.CreateNetwork("dummy", genericOption)
+	ipdList := getIPv4Data(t, "")
+	err := d.CreateNetwork("dummy", genericOption, nil, ipdList, nil)
 	if err != nil {
 		t.Fatalf("Failed to create bridge: %v", err)
 	}
 
-	te1 := &testEndpoint{}
-	err = d.CreateEndpoint("dummy", "ep", te1, nil)
+	te1 := newTestEndpoint(ipdList[0].Pool, 11)
+	err = d.CreateEndpoint("dummy", "ep", te1.Interface(), nil)
 	if err != nil {
 		t.Fatalf("Failed to create a link: %s", err.Error())
 	}
 
-	te2 := &testEndpoint{}
-	err = d.CreateEndpoint("dummy", "ep", te2, nil)
+	te2 := newTestEndpoint(ipdList[0].Pool, 12)
+	err = d.CreateEndpoint("dummy", "ep", te2.Interface(), nil)
 	if err != nil {
 		if _, ok := err.(driverapi.ErrEndpointExists); !ok {
 			t.Fatalf("Failed with a wrong error: %s", err.Error())
@@ -144,7 +145,7 @@ func TestLinkCreateNoEnableIPv6(t *testing.T) {
 	defer testutils.SetupTestOSContext(t)()
 	d := newDriver()
 
-	if err := d.Config(nil); err != nil {
+	if err := d.configure(nil); err != nil {
 		t.Fatalf("Failed to setup driver config: %v", err)
 	}
 
@@ -153,19 +154,19 @@ func TestLinkCreateNoEnableIPv6(t *testing.T) {
 	genericOption := make(map[string]interface{})
 	genericOption[netlabel.GenericData] = config
 
-	err := d.CreateNetwork("dummy", genericOption)
+	ipdList := getIPv4Data(t, "")
+	err := d.CreateNetwork("dummy", genericOption, nil, ipdList, nil)
 	if err != nil {
 		t.Fatalf("Failed to create bridge: %v", err)
 	}
-
-	te := &testEndpoint{}
-	err = d.CreateEndpoint("dummy", "ep", te, nil)
+	te := newTestEndpoint(ipdList[0].Pool, 30)
+	err = d.CreateEndpoint("dummy", "ep", te.Interface(), nil)
 	if err != nil {
 		t.Fatalf("Failed to create a link: %s", err.Error())
 	}
 
 	iface := te.iface
-	if iface.addrv6.IP.To16() != nil {
+	if iface.addrv6 != nil && iface.addrv6.IP.To16() != nil {
 		t.Fatalf("Expectd IPv6 address to be nil when IPv6 is not enabled. Got IPv6 = %s", iface.addrv6.String())
 	}
 
@@ -178,7 +179,7 @@ func TestLinkDelete(t *testing.T) {
 	defer testutils.SetupTestOSContext(t)()
 	d := newDriver()
 
-	if err := d.Config(nil); err != nil {
+	if err := d.configure(nil); err != nil {
 		t.Fatalf("Failed to setup driver config: %v", err)
 	}
 
@@ -188,13 +189,14 @@ func TestLinkDelete(t *testing.T) {
 	genericOption := make(map[string]interface{})
 	genericOption[netlabel.GenericData] = config
 
-	err := d.CreateNetwork("dummy", genericOption)
+	ipdList := getIPv4Data(t, "")
+	err := d.CreateNetwork("dummy", genericOption, nil, ipdList, nil)
 	if err != nil {
 		t.Fatalf("Failed to create bridge: %v", err)
 	}
 
-	te := &testEndpoint{}
-	err = d.CreateEndpoint("dummy", "ep1", te, nil)
+	te := newTestEndpoint(ipdList[0].Pool, 30)
+	err = d.CreateEndpoint("dummy", "ep1", te.Interface(), nil)
 	if err != nil {
 		t.Fatalf("Failed to create a link: %s", err.Error())
 	}

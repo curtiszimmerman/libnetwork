@@ -1,14 +1,20 @@
 package remote
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
 	"github.com/docker/docker/pkg/plugins"
+	"github.com/docker/libnetwork/datastore"
+	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
 	_ "github.com/docker/libnetwork/testutils"
 	"github.com/docker/libnetwork/types"
@@ -22,7 +28,7 @@ func decodeToMap(r *http.Request) (res map[string]interface{}, err error) {
 func handle(t *testing.T, mux *http.ServeMux, method string, h func(map[string]interface{}) interface{}) {
 	mux.HandleFunc(fmt.Sprintf("/%s.%s", driverapi.NetworkPluginEndpointType, method), func(w http.ResponseWriter, r *http.Request) {
 		ask, err := decodeToMap(r)
-		if err != nil {
+		if err != nil && err != io.EOF {
 			t.Fatal(err)
 		}
 		answer := h(ask)
@@ -34,67 +40,103 @@ func handle(t *testing.T, mux *http.ServeMux, method string, h func(map[string]i
 }
 
 func setupPlugin(t *testing.T, name string, mux *http.ServeMux) func() {
-	if err := os.MkdirAll("/usr/share/docker/plugins", 0755); err != nil {
+	if err := os.MkdirAll("/etc/docker/plugins", 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	listener, err := net.Listen("unix", fmt.Sprintf("/usr/share/docker/plugins/%s.sock", name))
-	if err != nil {
-		t.Fatal("Could not listen to the plugin socket")
+	server := httptest.NewServer(mux)
+	if server == nil {
+		t.Fatal("Failed to start an HTTP Server")
+	}
+
+	if err := ioutil.WriteFile(fmt.Sprintf("/etc/docker/plugins/%s.spec", name), []byte(server.URL), 0644); err != nil {
+		t.Fatal(err)
 	}
 
 	mux.HandleFunc("/Plugin.Activate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.docker.plugins.v1+json")
 		fmt.Fprintf(w, `{"Implements": ["%s"]}`, driverapi.NetworkPluginEndpointType)
 	})
 
-	go http.Serve(listener, mux)
-
 	return func() {
-		listener.Close()
-		if err := os.RemoveAll("/usr/share/docker/plugins"); err != nil {
+		if err := os.RemoveAll("/etc/docker/plugins"); err != nil {
 			t.Fatal(err)
 		}
+		server.Close()
 	}
 }
 
 type testEndpoint struct {
-	t              *testing.T
-	src            string
-	dst            string
-	address        string
-	addressIPv6    string
-	macAddress     string
-	gateway        string
-	gatewayIPv6    string
-	resolvConfPath string
-	hostsPath      string
-	nextHop        string
-	destination    string
-	routeType      int
+	t                     *testing.T
+	src                   string
+	dst                   string
+	address               string
+	addressIPv6           string
+	macAddress            string
+	gateway               string
+	gatewayIPv6           string
+	resolvConfPath        string
+	hostsPath             string
+	nextHop               string
+	destination           string
+	routeType             int
+	disableGatewayService bool
 }
 
 func (test *testEndpoint) Interface() driverapi.InterfaceInfo {
+	return test
+}
+
+func (test *testEndpoint) Address() *net.IPNet {
+	if test.address == "" {
+		return nil
+	}
+	nw, _ := types.ParseCIDR(test.address)
+	return nw
+}
+
+func (test *testEndpoint) AddressIPv6() *net.IPNet {
+	if test.addressIPv6 == "" {
+		return nil
+	}
+	nw, _ := types.ParseCIDR(test.addressIPv6)
+	return nw
+}
+
+func (test *testEndpoint) MacAddress() net.HardwareAddr {
+	if test.macAddress == "" {
+		return nil
+	}
+	mac, _ := net.ParseMAC(test.macAddress)
+	return mac
+}
+
+func (test *testEndpoint) SetMacAddress(mac net.HardwareAddr) error {
+	if test.macAddress != "" {
+		return types.ForbiddenErrorf("endpoint interface MAC address present (%s). Cannot be modified with %s.", test.macAddress, mac)
+	}
+	if mac == nil {
+		return types.BadRequestErrorf("tried to set nil MAC address to endpoint interface")
+	}
+	test.macAddress = mac.String()
 	return nil
 }
 
-func (test *testEndpoint) AddInterface(mac net.HardwareAddr, ipv4 net.IPNet, ipv6 net.IPNet) error {
-	ip4, net4, _ := net.ParseCIDR(test.address)
-	ip6, net6, _ := net.ParseCIDR(test.addressIPv6)
-	if ip4 != nil {
-		net4.IP = ip4
-		if !types.CompareIPNet(net4, &ipv4) {
-			test.t.Fatalf("Wrong address given %+v", ipv4)
-		}
+func (test *testEndpoint) SetIPAddress(address *net.IPNet) error {
+	if address.IP == nil {
+		return types.BadRequestErrorf("tried to set nil IP address to endpoint interface")
 	}
-	if ip6 != nil {
-		net6.IP = ip6
-		if !types.CompareIPNet(net6, &ipv6) {
-			test.t.Fatalf("Wrong address (IPv6) given %+v", ipv6)
-		}
+	if address.IP.To4() == nil {
+		return setAddress(&test.addressIPv6, address)
 	}
-	if test.macAddress != "" && mac.String() != test.macAddress {
-		test.t.Fatalf("Wrong MAC address given %v", mac)
+	return setAddress(&test.address, address)
+}
+
+func setAddress(ifaceAddr *string, address *net.IPNet) error {
+	if *ifaceAddr != "" {
+		return types.ForbiddenErrorf("endpoint interface IP present (%s). Cannot be modified with (%s).", *ifaceAddr, address)
 	}
+	*ifaceAddr = address.String()
 	return nil
 }
 
@@ -153,6 +195,99 @@ func (test *testEndpoint) AddStaticRoute(destination *net.IPNet, routeType int, 
 	return nil
 }
 
+func (test *testEndpoint) DisableGatewayService() {
+	test.disableGatewayService = true
+}
+
+func (test *testEndpoint) AddTableEntry(tableName string, key string, value []byte) error {
+	return nil
+}
+
+func TestGetEmptyCapabilities(t *testing.T) {
+	var plugin = "test-net-driver-empty-cap"
+
+	mux := http.NewServeMux()
+	defer setupPlugin(t, plugin, mux)()
+
+	handle(t, mux, "GetCapabilities", func(msg map[string]interface{}) interface{} {
+		return map[string]interface{}{}
+	})
+
+	p, err := plugins.Get(plugin, driverapi.NetworkPluginEndpointType)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDriver(plugin, p.Client())
+	if d.Type() != plugin {
+		t.Fatal("Driver type does not match that given")
+	}
+
+	_, err = d.(*driver).getCapabilities()
+	if err == nil {
+		t.Fatal("There should be error reported when get empty capability")
+	}
+}
+
+func TestGetExtraCapabilities(t *testing.T) {
+	var plugin = "test-net-driver-extra-cap"
+
+	mux := http.NewServeMux()
+	defer setupPlugin(t, plugin, mux)()
+
+	handle(t, mux, "GetCapabilities", func(msg map[string]interface{}) interface{} {
+		return map[string]interface{}{
+			"Scope": "local",
+			"foo":   "bar",
+		}
+	})
+
+	p, err := plugins.Get(plugin, driverapi.NetworkPluginEndpointType)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDriver(plugin, p.Client())
+	if d.Type() != plugin {
+		t.Fatal("Driver type does not match that given")
+	}
+
+	c, err := d.(*driver).getCapabilities()
+	if err != nil {
+		t.Fatal(err)
+	} else if c.DataScope != datastore.LocalScope {
+		t.Fatalf("get capability '%s', expecting 'local'", c.DataScope)
+	}
+}
+
+func TestGetInvalidCapabilities(t *testing.T) {
+	var plugin = "test-net-driver-invalid-cap"
+
+	mux := http.NewServeMux()
+	defer setupPlugin(t, plugin, mux)()
+
+	handle(t, mux, "GetCapabilities", func(msg map[string]interface{}) interface{} {
+		return map[string]interface{}{
+			"Scope": "fake",
+		}
+	})
+
+	p, err := plugins.Get(plugin, driverapi.NetworkPluginEndpointType)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDriver(plugin, p.Client())
+	if d.Type() != plugin {
+		t.Fatal("Driver type does not match that given")
+	}
+
+	_, err = d.(*driver).getCapabilities()
+	if err == nil {
+		t.Fatal("There should be error reported when get invalid capability")
+	}
+}
+
 func TestRemoteDriver(t *testing.T) {
 	var plugin = "test-net-driver"
 
@@ -162,7 +297,7 @@ func TestRemoteDriver(t *testing.T) {
 		dst:            "vethdst",
 		address:        "192.168.5.7/16",
 		addressIPv6:    "2001:DB8::5:7/48",
-		macAddress:     "7a:56:78:34:12:da",
+		macAddress:     "ab:cd:ef:ee:ee:ee",
 		gateway:        "192.168.0.1",
 		gatewayIPv6:    "2001:DB8::1",
 		hostsPath:      "/here/comes/the/host/path",
@@ -177,6 +312,11 @@ func TestRemoteDriver(t *testing.T) {
 
 	var networkID string
 
+	handle(t, mux, "GetCapabilities", func(msg map[string]interface{}) interface{} {
+		return map[string]interface{}{
+			"Scope": "global",
+		}
+	})
 	handle(t, mux, "CreateNetwork", func(msg map[string]interface{}) interface{} {
 		nid := msg["NetworkID"]
 		var ok bool
@@ -193,9 +333,9 @@ func TestRemoteDriver(t *testing.T) {
 	})
 	handle(t, mux, "CreateEndpoint", func(msg map[string]interface{}) interface{} {
 		iface := map[string]interface{}{
+			"MacAddress":  ep.macAddress,
 			"Address":     ep.address,
 			"AddressIPv6": ep.addressIPv6,
-			"MacAddress":  ep.macAddress,
 		}
 		return map[string]interface{}{
 			"Interface": iface,
@@ -217,7 +357,7 @@ func TestRemoteDriver(t *testing.T) {
 				"DstPrefix": ep.dst,
 			},
 			"StaticRoutes": []map[string]interface{}{
-				map[string]interface{}{
+				{
 					"Destination": ep.destination,
 					"RouteType":   ep.routeType,
 					"NextHop":     ep.nextHop,
@@ -239,59 +379,77 @@ func TestRemoteDriver(t *testing.T) {
 			},
 		}
 	})
+	handle(t, mux, "DiscoverNew", func(msg map[string]interface{}) interface{} {
+		return map[string]string{}
+	})
+	handle(t, mux, "DiscoverDelete", func(msg map[string]interface{}) interface{} {
+		return map[string]interface{}{}
+	})
 
 	p, err := plugins.Get(plugin, driverapi.NetworkPluginEndpointType)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	driver := newDriver(plugin, p.Client)
-	if driver.Type() != plugin {
+	d := newDriver(plugin, p.Client())
+	if d.Type() != plugin {
 		t.Fatal("Driver type does not match that given")
 	}
 
+	c, err := d.(*driver).getCapabilities()
+	if err != nil {
+		t.Fatal(err)
+	} else if c.DataScope != datastore.GlobalScope {
+		t.Fatalf("get capability '%s', expecting 'global'", c.DataScope)
+	}
+
 	netID := "dummy-network"
-	err = driver.CreateNetwork(netID, map[string]interface{}{})
+	err = d.CreateNetwork(netID, map[string]interface{}{}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	endID := "dummy-endpoint"
-	err = driver.CreateEndpoint(netID, endID, ep, map[string]interface{}{})
+	ifInfo := &testEndpoint{}
+	err = d.CreateEndpoint(netID, endID, ifInfo, map[string]interface{}{})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	if !bytes.Equal(ep.MacAddress(), ifInfo.MacAddress()) || !types.CompareIPNet(ep.Address(), ifInfo.Address()) ||
+		!types.CompareIPNet(ep.AddressIPv6(), ifInfo.AddressIPv6()) {
+		t.Fatalf("Unexpected InterfaceInfo data. Expected (%s, %s, %s). Got (%v, %v, %v)",
+			ep.MacAddress(), ep.Address(), ep.AddressIPv6(),
+			ifInfo.MacAddress(), ifInfo.Address(), ifInfo.AddressIPv6())
 	}
 
 	joinOpts := map[string]interface{}{"foo": "fooValue"}
-	err = driver.Join(netID, endID, "sandbox-key", ep, joinOpts)
+	err = d.Join(netID, endID, "sandbox-key", ep, joinOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = driver.EndpointOperInfo(netID, endID); err != nil {
+	if _, err = d.EndpointOperInfo(netID, endID); err != nil {
 		t.Fatal(err)
 	}
-	if err = driver.Leave(netID, endID); err != nil {
+	if err = d.Leave(netID, endID); err != nil {
 		t.Fatal(err)
 	}
-	if err = driver.DeleteEndpoint(netID, endID); err != nil {
+	if err = d.DeleteEndpoint(netID, endID); err != nil {
 		t.Fatal(err)
 	}
-	if err = driver.DeleteNetwork(netID); err != nil {
+	if err = d.DeleteNetwork(netID); err != nil {
 		t.Fatal(err)
 	}
-}
 
-type failEndpoint struct {
-	t *testing.T
-}
-
-func (f *failEndpoint) Interfaces() []*driverapi.InterfaceInfo {
-	f.t.Fatal("Unexpected call of Interfaces")
-	return nil
-}
-func (f *failEndpoint) AddInterface(int, net.HardwareAddr, net.IPNet, net.IPNet) error {
-	f.t.Fatal("Unexpected call of AddInterface")
-	return nil
+	data := discoverapi.NodeDiscoveryData{
+		Address: "192.168.1.1",
+	}
+	if err = d.DiscoverNew(discoverapi.NodeDiscovery, data); err != nil {
+		t.Fatal(err)
+	}
+	if err = d.DiscoverDelete(discoverapi.NodeDiscovery, data); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDriverError(t *testing.T) {
@@ -311,7 +469,7 @@ func TestDriverError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	driver := newDriver(plugin, p.Client)
+	driver := newDriver(plugin, p.Client())
 
 	if err := driver.CreateEndpoint("dummy", "dummy", &testEndpoint{t: t}, map[string]interface{}{}); err == nil {
 		t.Fatalf("Expected error from driver")
@@ -335,7 +493,7 @@ func TestMissingValues(t *testing.T) {
 			"MacAddress":  ep.macAddress,
 		}
 		return map[string]interface{}{
-			"Interfaces": []interface{}{iface},
+			"Interface": iface,
 		}
 	})
 
@@ -343,7 +501,7 @@ func TestMissingValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	driver := newDriver(plugin, p.Client)
+	driver := newDriver(plugin, p.Client())
 
 	if err := driver.CreateEndpoint("dummy", "dummy", ep, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
@@ -354,11 +512,27 @@ type rollbackEndpoint struct {
 }
 
 func (r *rollbackEndpoint) Interface() driverapi.InterfaceInfo {
+	return r
+}
+
+func (r *rollbackEndpoint) MacAddress() net.HardwareAddr {
 	return nil
 }
 
-func (r *rollbackEndpoint) AddInterface(_ net.HardwareAddr, _ net.IPNet, _ net.IPNet) error {
-	return fmt.Errorf("fail this to trigger a rollback")
+func (r *rollbackEndpoint) Address() *net.IPNet {
+	return nil
+}
+
+func (r *rollbackEndpoint) AddressIPv6() *net.IPNet {
+	return nil
+}
+
+func (r *rollbackEndpoint) SetMacAddress(mac net.HardwareAddr) error {
+	return fmt.Errorf("invalid mac")
+}
+
+func (r *rollbackEndpoint) SetIPAddress(ip *net.IPNet) error {
+	return fmt.Errorf("invalid ip")
 }
 
 func TestRollback(t *testing.T) {
@@ -388,11 +562,11 @@ func TestRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	driver := newDriver(plugin, p.Client)
+	driver := newDriver(plugin, p.Client())
 
 	ep := &rollbackEndpoint{}
 
-	if err := driver.CreateEndpoint("dummy", "dummy", ep, map[string]interface{}{}); err == nil {
+	if err := driver.CreateEndpoint("dummy", "dummy", ep.Interface(), map[string]interface{}{}); err == nil {
 		t.Fatalf("Expected error from driver")
 	}
 	if !rolledback {
